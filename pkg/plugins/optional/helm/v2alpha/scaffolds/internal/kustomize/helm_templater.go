@@ -219,8 +219,8 @@ func (t *HelmTemplater) substituteRBACValues(yamlContent string) string {
 func (t *HelmTemplater) templateDeploymentFields(yamlContent string) string {
 	// Template configuration fields
 	yamlContent = t.templateImageReference(yamlContent)
-	yamlContent = t.templateEnvironmentVariables(yamlContent)
 	yamlContent = t.templateResources(yamlContent)
+	yamlContent = t.templateEnvironmentVariables(yamlContent)
 	yamlContent = t.templateSecurityContexts(yamlContent)
 	yamlContent = t.templateVolumeMounts(yamlContent)
 	yamlContent = t.templateVolumes(yamlContent)
@@ -237,9 +237,88 @@ func (t *HelmTemplater) templateEnvironmentVariables(yamlContent string) string 
 
 // templateResources converts resource sections to Helm templates
 func (t *HelmTemplater) templateResources(yamlContent string) string {
-	// This ensures that volumeMounts, volumes, and other fields are preserved
-	// The resources will remain as-is from the kustomize output and can be templated later
-	return yamlContent
+	// Find the containers: block and its indent
+	contHdr := regexp.MustCompile(`(?m)^(\s*)containers:\s*$`)
+	hdrLoc := contHdr.FindStringSubmatchIndex(yamlContent)
+	if hdrLoc == nil {
+		return yamlContent
+	}
+
+	// Find list items - they should be after containers:
+	afterContainers := yamlContent[hdrLoc[1]:]
+
+	// Find first list item to determine actual indentation
+	firstItemRe := regexp.MustCompile(`(?m)^(\s*)- `)
+	firstItemMatch := firstItemRe.FindStringSubmatchIndex(afterContainers)
+	if firstItemMatch == nil {
+		return yamlContent
+	}
+
+	itemIndent := afterContainers[firstItemMatch[2]:firstItemMatch[3]]
+
+	// Process with the detected indentation
+	rest := afterContainers
+	itemRe := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(itemIndent) + `- `)
+
+	var out strings.Builder
+	out.WriteString(yamlContent[:hdrLoc[1]])
+	idx := 0
+	for {
+		start := itemRe.FindStringIndex(rest[idx:])
+		if start == nil {
+			out.WriteString(rest[idx:])
+			break
+		}
+		// Absolute bounds in 'rest'
+		s := idx + start[0]
+		e := idx + start[1]
+
+		// Find end of this item: next item at same indent (search from end of current match)
+		next := itemRe.FindStringIndex(rest[e:])
+		itemEnd := len(rest)
+		if next != nil {
+			itemEnd = e + next[0]
+		}
+		item := rest[s:itemEnd]
+
+		// Only touch the item that has name: manager|controller-manager
+		// Capture the indent from the name line for consistent field alignment
+		nameRe := regexp.MustCompile(`(?m)^([ \t]+)name:\s*(manager|controller-manager)\s*$`)
+		nameMatch := nameRe.FindStringSubmatchIndex(item)
+		if nameMatch != nil {
+			// Get the indent for fields in this container
+			indent := item[nameMatch[2]:nameMatch[3]]
+			nindent := len(indent) + 2
+
+			// Build resources template with proper indentation
+			resourcesTemplate := indent + `{{- with .Values.controllerManager.resources }}` + "\n" +
+				indent + `resources:` + "\n" +
+				`{{- toYaml . | nindent ` + fmt.Sprint(nindent) + ` }}` + "\n" +
+				indent + `{{- end }}`
+
+			// Check if resources block already exists
+			resRe := regexp.MustCompile(`(?ms)^` + regexp.QuoteMeta(indent) + `resources:\s*\n(?:` + regexp.QuoteMeta(indent) + `\s+.*\n)*`)
+			if resRe.MatchString(item) {
+				// Replace existing resources block entirely
+				item = resRe.ReplaceAllString(item, resourcesTemplate+"\n")
+			} else {
+				// Prefer insertion right after the image block end
+				endRe := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(indent) + `{{- end }}\s*$`)
+				if m := endRe.FindStringIndex(item); m != nil {
+					// Insert after image block with proper spacing
+					item = item[:m[1]] + "\n" + resourcesTemplate + "\n" + item[m[1]:]
+				} else {
+					// Fallback: insert after name line
+					item = nameRe.ReplaceAllString(item, `$0`+"\n"+resourcesTemplate+"\n")
+				}
+			}
+		}
+
+		out.WriteString(rest[idx:s])
+		out.WriteString(item)
+		idx = itemEnd
+	}
+	return out.String()
 }
 
 // templateSecurityContexts preserves security contexts from kustomize output
@@ -265,27 +344,99 @@ func (t *HelmTemplater) templateVolumes(yamlContent string) string {
 
 // templateImageReference converts hardcoded image references to Helm templates
 func (t *HelmTemplater) templateImageReference(yamlContent string) string {
-	// Replace hardcoded controller image with Helm template
-	// This handles the common case where kustomize outputs "controller:latest"
-	// or other hardcoded image references
-	imagePattern := regexp.MustCompile(`(\s+)image:\s+controller:latest`)
-	yamlContent = imagePattern.ReplaceAllString(yamlContent,
-		`${1}image: "{{ .Values.controllerManager.image.repository }}:{{ .Values.controllerManager.image.tag }}"`)
+	// Find the containers: block and its indent
+	contHdr := regexp.MustCompile(`(?m)^(\s*)containers:\s*$`)
+	hdrLoc := contHdr.FindStringSubmatchIndex(yamlContent)
+	if hdrLoc == nil {
+		return yamlContent
+	}
 
-	// Also handle any other common image patterns that might appear
-	imagePattern2 := regexp.MustCompile(`(\s+)image:\s+([^"'\s]+):(latest|[\w\.\-]+)`)
-	yamlContent = imagePattern2.ReplaceAllStringFunc(yamlContent, func(match string) string {
-		// Only replace if it looks like a controller image (contains "controller" or "manager")
-		if strings.Contains(match, "controller") || strings.Contains(match, "manager") {
-			indentMatch := regexp.MustCompile(`^(\s+)`)
-			indent := indentMatch.FindString(match)
-			return fmt.Sprintf(
-				`%simage: "{{ .Values.controllerManager.image.repository }}:{{ .Values.controllerManager.image.tag }}"`, indent)
+	// Find list items - they should be after containers:
+	afterContainers := yamlContent[hdrLoc[1]:]
+
+	// Find first list item to determine actual indentation
+	firstItemRe := regexp.MustCompile(`(?m)^(\s*)- `)
+	firstItemMatch := firstItemRe.FindStringSubmatchIndex(afterContainers)
+	if firstItemMatch == nil {
+		return yamlContent
+	}
+
+	itemIndent := afterContainers[firstItemMatch[2]:firstItemMatch[3]]
+
+	// Process with the detected indentation
+	rest := afterContainers
+	itemRe := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(itemIndent) + `- `)
+
+	var out strings.Builder
+	out.WriteString(yamlContent[:hdrLoc[1]])
+
+	idx := 0
+	for {
+		start := itemRe.FindStringIndex(rest[idx:])
+		if start == nil {
+			out.WriteString(rest[idx:])
+			break
 		}
-		return match
-	})
+		// Absolute bounds in 'rest'
+		s := idx + start[0]
+		e := idx + start[1]
 
-	return yamlContent
+		// Find end of this item: next item at same indent (search from end of current match)
+		next := itemRe.FindStringIndex(rest[e:])
+		itemEnd := len(rest)
+		if next != nil {
+			itemEnd = e + next[0]
+		}
+		item := rest[s:itemEnd]
+
+		// Only touch the item that has name: manager|controller-manager
+		// Capture the indent from the name line for consistent field alignment
+		nameRe := regexp.MustCompile(`(?m)^([ \t]+)name:\s*(manager|controller-manager)\s*$`)
+		nameMatch := nameRe.FindStringSubmatchIndex(item)
+		if nameMatch != nil {
+			// Get the indent for fields in this container
+			indent := item[nameMatch[2]:nameMatch[3]]
+
+			// Build the image block with proper indentation
+			imageBlock :=
+				indent + `{{- if .Values.controllerManager.image.digest }}` + "\n" +
+					indent + `image: "{{ .Values.controllerManager.image.repository }}@{{ .Values.controllerManager.image.digest }}"` + "\n" +
+					indent + `{{- else }}` + "\n" +
+					indent + `image: "{{ .Values.controllerManager.image.repository }}:{{ .Values.controllerManager.image.tag }}"` + "\n" +
+					indent + `{{- end }}`
+
+			// Replace existing image line or insert after name
+			imgLineRe := regexp.MustCompile(`(?m)^[ \t]*image:\s*.*$`)
+			if imgLineRe.MatchString(item) {
+				item = imgLineRe.ReplaceAllString(item, imageBlock)
+			} else {
+				// Insert after name line
+				item = nameRe.ReplaceAllString(item, `$0`+"\n"+imageBlock)
+			}
+
+			// Handle imagePullPolicy without relying on backrefs
+			ppRe := regexp.MustCompile(`(?m)^[ \t]*imagePullPolicy:\s*.*$`)
+			if ppRe.MatchString(item) {
+				item = ppRe.ReplaceAllStringFunc(item, func(_ string) string {
+					return indent + `imagePullPolicy: "{{ .Values.controllerManager.image.pullPolicy }}"`
+				})
+			} else {
+				// Insert immediately after the image block
+				endLine := indent + `{{- end }}`
+				item = strings.Replace(
+					item,
+					endLine,
+					endLine+"\n"+indent+`imagePullPolicy: "{{ .Values.controllerManager.image.pullPolicy }}"`,
+					1,
+				)
+			}
+		}
+
+		out.WriteString(rest[idx:s])
+		out.WriteString(item)
+		idx = itemEnd
+	}
+	return out.String()
 }
 
 // makeWebhookAnnotationsConditional makes only cert-manager annotations conditional, not the entire webhook

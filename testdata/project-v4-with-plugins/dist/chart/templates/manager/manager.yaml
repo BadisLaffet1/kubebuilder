@@ -36,7 +36,12 @@ spec:
                       value: busybox:1.36.1
                     - name: MEMCACHED_IMAGE
                       value: memcached:1.6.26-alpine3.19
+                  {{- if .Values.controllerManager.image.digest }}
+                  image: "{{ .Values.controllerManager.image.repository }}@{{ .Values.controllerManager.image.digest }}"
+                  {{- else }}
                   image: "{{ .Values.controllerManager.image.repository }}:{{ .Values.controllerManager.image.tag }}"
+                  {{- end }}
+                  imagePullPolicy: "{{ .Values.controllerManager.image.pullPolicy }}"
                   livenessProbe:
                     httpGet:
                         path: /healthz
@@ -54,34 +59,7 @@ spec:
                         port: 8081
                     initialDelaySeconds: 5
                     periodSeconds: 10
+                  {{- with .Values.controllerManager.resources }}
                   resources:
-                    limits:
-                        cpu: 500m
-                        memory: 128Mi
-                    requests:
-                        cpu: 10m
-                        memory: 64Mi
-                  securityContext:
-                    allowPrivilegeEscalation: false
-                    capabilities:
-                        drop:
-                            - ALL
-                    readOnlyRootFilesystem: true
-                  volumeMounts:
-                    {{- if .Values.certManager.enable }}
-                    - mountPath: /tmp/k8s-webhook-server/serving-certs
-                      name: webhook-certs
-                      readOnly: true
-                    {{- end }}
-            securityContext:
-                runAsNonRoot: true
-                seccompProfile:
-                    type: RuntimeDefault
-            serviceAccountName: project-v4-with-plugins-controller-manager
-            terminationGracePeriodSeconds: 10
-            volumes:
-                {{- if .Values.certManager.enable }}
-                - name: webhook-certs
-                  secret:
-                    secretName: webhook-server-cert
-                {{- end }}
+{{- toYaml . | nindent 20 }}
+                  {{- end }}
